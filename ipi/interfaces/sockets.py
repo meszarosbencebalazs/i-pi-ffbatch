@@ -1102,7 +1102,6 @@ class InterfaceSocket(object):
         port=31415,
         slots=4,
         mode="unix",
-        shm=False,
         timeout=1.0,
         match_mode="auto",
         exit_on_disconnect=False,
@@ -1123,14 +1122,13 @@ class InterfaceSocket(object):
             max_workers: Maximum number of threads launched concurrently
 
         Raises:
-           NameError: Raised if mode is not 'unix' or 'inet'.
+           NameError: Raised if mode is not 'unix', 'inet' or 'shm'.
         """
 
         self.address = address
         self.port = port
         self.slots = slots
         self.mode = mode
-        self.shm = shm
         self.timeout = timeout
         self.sockets_prefix = sockets_prefix
         self.poll_iter = UPDATEFREQ  # triggers pool_update at first poll
@@ -1148,18 +1146,20 @@ class InterfaceSocket(object):
         create the associated socket object.
         """
 
-        if self.mode == "unix":
+        if self.mode in ("unix", "shm"):
             self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 self.server.bind(self.sockets_prefix + self.address)
                 info(
-                    " @interfacesocket.open: Created unix socket with address "
+                    " @interfacesocket.open: Created "
+                    + self.mode
+                    + " socket with address "
                     + self.address,
                     verbosity.medium,
                 )
             except socket.error:
                 raise RuntimeError(
-                    "Error opening unix socket. Check if a file "
+                    "Error opening local socket. Check if a file "
                     + (self.sockets_prefix + self.address)
                     + " exists, and remove it if unused."
                 )
@@ -1187,7 +1187,7 @@ class InterfaceSocket(object):
             raise NameError(
                 "InterfaceSocket mode "
                 + self.mode
-                + " is not implemented (should be unix/inet)"
+                + " is not implemented (should be unix/inet/shm)"
             )
 
         self.server.listen(self.slots)
@@ -1225,7 +1225,7 @@ class InterfaceSocket(object):
                 " @interfacesocket.close: Problem shutting down the server socket. Will just continue and hope for the best.",
                 verbosity.low,
             )
-        if self.mode == "unix":
+        if self.mode in ("unix", "shm"):
             os.unlink(self.sockets_prefix + self.address)
 
     def poll(self):
@@ -1298,7 +1298,7 @@ class InterfaceSocket(object):
                 client, address = self.server.accept()
                 client.settimeout(TIMEOUT)
                
-                if self.shm:
+                if self.mode == "shm":
                     driver = SHMDriver(client)
                     info(" @interfacesocket.pool_update: Using SHM communication", verbosity.low)
                 else:

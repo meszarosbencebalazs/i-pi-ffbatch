@@ -172,7 +172,7 @@ class InputFFSocket(InputForceField):
     Handles generating one instance of a socket interface forcefield class.
 
     Attributes:
-       mode: Describes whether the socket will be a unix or an internet socket.
+       mode: Describes whether the socket will use unix, internet, or shared-memory communication.
 
     Fields:
        address: The server socket binding address.
@@ -230,17 +230,9 @@ class InputFFSocket(InputForceField):
             InputAttribute,
             {
                 "dtype": str,
-                "options": ["unix", "inet"],
+                "options": ["unix", "inet", "shm"],
                 "default": "inet",
-                "help": "Specifies whether the driver interface will listen onto a internet socket [inet] or onto a unix socket [unix].",
-            },
-        ),
-        "shm": (
-            InputAttribute,
-            {
-                "dtype": bool,
-                "default": False,
-                "help": "Specifies whether to use shared memory communication (only available in unix mode)",
+                "help": "Specifies whether the driver interface will listen onto an internet socket [inet], a unix socket [unix], or a unix socket using shared-memory transfers [shm].",
             },
         ),
 
@@ -290,7 +282,6 @@ class InputFFSocket(InputForceField):
         self.timeout.store(ff.socket.timeout)
         self.slots.store(ff.socket.slots)
         self.mode.store(ff.socket.mode)
-        self.shm.store(ff.socket.shm)
         self.matching.store(ff.socket.match_mode)
         self.exit_on_disconnect.store(ff.socket.exit_on_disconnect)
         self.threaded.store(True)  # hard-coded
@@ -327,7 +318,6 @@ class InputFFSocket(InputForceField):
                 port=self.port.fetch(),
                 slots=self.slots.fetch(),
                 mode=self.mode.fetch(),
-                shm=self.shm.fetch(),
                 timeout=self.timeout.fetch(),
                 match_mode=self.matching.fetch(),
                 exit_on_disconnect=self.exit_on_disconnect.fetch(),
@@ -365,8 +355,7 @@ class InputFFBatch(InputForceField):
     driver that supports batch communication.
 
     Attributes:
-       mode: Describes whether the socket will be a unix or an internet socket.
-       shm: Whether to use shared memory for bulk data transfer (unix only).
+       mode: Describes whether the socket will use unix, internet, or shared-memory communication.
        matching: Dispatch policy for mapping requests to clients.
 
     Fields:
@@ -425,17 +414,9 @@ class InputFFBatch(InputForceField):
             InputAttribute,
             {
                 "dtype": str,
-                "options": ["unix", "inet"],
+                "options": ["unix", "inet", "shm"],
                 "default": "inet",
-                "help": "Specifies whether the driver interface will listen onto a internet socket [inet] or onto a unix socket [unix].",
-            },
-        ),
-        "shm": (
-            InputAttribute,
-            {
-                "dtype": bool,
-                "default": False,
-                "help": "Specifies whether to use shared memory communication (only available in unix mode)",
+                "help": "Specifies whether the driver interface will listen onto an internet socket [inet], a unix socket [unix], or a unix socket using shared-memory transfers [shm].",
             },
         ),
         "matching": (
@@ -486,7 +467,6 @@ class InputFFBatch(InputForceField):
         self.timeout.store(ff.socket.timeout)
         self.slots.store(ff.socket.slots)
         self.mode.store(ff.socket.mode)
-        self.shm.store(ff.socket.shm)
         self.matching.store(ff.socket.match_mode)
         self.exit_on_disconnect.store(ff.socket.exit_on_disconnect)
         self.threaded.store(True)  # hard-coded
@@ -523,7 +503,6 @@ class InputFFBatch(InputForceField):
                 port=self.port.fetch(),
                 slots=self.slots.fetch(),
                 mode=self.mode.fetch(),
-                shm=self.shm.fetch(),
                 timeout=self.timeout.fetch(),
                 match_mode=self.matching.fetch(),
                 exit_on_disconnect=self.exit_on_disconnect.fetch(),

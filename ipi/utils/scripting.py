@@ -155,7 +155,7 @@ def forcefield_xml(
 {parameters}
 </ffdirect>
 """
-    elif mode == "unix" or mode == "inet":
+    elif mode in ("unix", "inet", "shm"):
         if address is None:
             raise ValueError("Must specify address for {mode} forcefields")
         if mode == "inet" and port is None:
@@ -169,7 +169,7 @@ def forcefield_xml(
 """
     else:
         raise ValueError(
-            "Invalid forcefield mode, use ['direct', 'unix', 'inet'] or set up manually"
+            "Invalid forcefield mode, use ['direct', 'unix', 'inet', 'shm'] or set up manually"
         )
 
     return xml_ff
