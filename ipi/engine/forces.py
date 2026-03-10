@@ -25,7 +25,7 @@ from ipi.utils.depend import *
 from ipi.utils.nmtransform import nm_rescale
 from ipi.engine.beads import Beads
 from ipi.engine.cell import Cell
-from ipi.engine.forcefields import FFBatch
+from ipi.engine.forcefields import FFSocket
 from ipi.utils.timing_manager import timers
 __all__ = ["Forces", "ForceComponent"]
 
@@ -647,11 +647,11 @@ class ForceComponent:
         self._forces = []
         self.beads = beads
         
-        if isinstance(self.ff, FFBatch):
+        if isinstance(self.ff, FFSocket) and getattr(self.ff, "batch", False):
             self.batch_mode = True
             self.batch_force = ForceBatchBead()
             
-            # here we bind all beads to one ffbatch object's depend values
+            # here we bind all beads to one batched socket forcefield object's depend values
             self.batch_force.bind(beads, cell, self.ff, output_maker=output_maker)
             
             self._f = self.batch_force._f

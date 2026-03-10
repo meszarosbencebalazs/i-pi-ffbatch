@@ -345,6 +345,7 @@ class FFSocket(ForceField):
         active=np.array([-1]),
         threaded=True,
         interface=None,
+        batch=False,
     ):
         """Initialises FFSocket.
 
@@ -358,6 +359,7 @@ class FFSocket(ForceField):
               before sending the positions to the client code.
            interface: The object used to create the socket used to interact
               with the client codes.
+           batch: If True, sends all beads in a single batched request.
         """
 
         # a socket to the communication library is created or linked
@@ -368,6 +370,7 @@ class FFSocket(ForceField):
             self.socket = InterfaceSocket()
         else:
             self.socket = interface
+        self.batch = batch
         self.socket.requests = self.requests
         self.socket.offset = self.offset
 
@@ -393,7 +396,9 @@ class FFSocket(ForceField):
 
 
 class FFBatch(FFSocket):
-    pass
+    def __init__(self, *args, **kwargs):
+        kwargs["batch"] = True
+        super(FFBatch, self).__init__(*args, **kwargs)
 
 class FFEval(ForceField):
     """General class for models that provide a self.evaluate(request)
