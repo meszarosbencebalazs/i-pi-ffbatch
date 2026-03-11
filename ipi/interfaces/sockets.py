@@ -729,8 +729,28 @@ class Driver(DriverSocket):
         self.pot_snp = None
         self.f_snp = None
         self.vir_snp = None
-
+        
+        
         if self.shm:
+            stale_names = []
+            for name in (
+                self.pos_bufname,
+                self.h_bufname,
+                self.ih_bufname,
+                self.pot_bufname,
+                self.f_bufname,
+                self.vir_bufname,
+            ):
+                if os.path.exists(os.path.join("/dev/shm", name)):
+                    stale_names.append(name)
+
+            if stale_names:
+                raise RuntimeError(
+                    "Refusing to reuse existing shared-memory segment names: "
+                    + ", ".join(stale_names)
+                    + ". Clean the stale /dev/shm/IPI-* entries before starting a new SHM driver."
+                )
+
             info(
                 f" @SOCKET: SHM driver initialized with buffer: {self.pos_bufname}",
                 verbosity.low,
@@ -1115,6 +1135,7 @@ class Driver(DriverSocket):
             self.nat = r["pos"].shape[1] // 3
             self.nbeads = r["pos"].shape[0]
 
+        
         self.pos_shm = shared_memory.SharedMemory(
             create=True, size=r["pos"].size * 8, name=self.pos_bufname
         )
@@ -1148,7 +1169,9 @@ class Driver(DriverSocket):
         )
 
     def np_to_shm(self, r):
-        self.pos_snp, self.h_snp, self.ih_snp = r["pos"], r["cell"][0], r["cell"][1]
+        self.pos_snp[:] = r["pos"]
+        self.h_snp[:] = r["cell"][0]
+        self.ih_snp[:] = r["cell"][1]
 
     def shm_to_np(self):
         mxtradict = ""
