@@ -4,7 +4,7 @@ import argparse
 import numpy as np
 from ipi.pes import Dummy_driver, load_pes, __drivers__
 from ipi.utils.io.inputs import read_args_kwargs
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 
 
 description = """
@@ -53,6 +53,14 @@ def send_data(sock, data):
         data = np.array([data], data.dtype)
     buf = data.tobytes()
     sock.send(buf)
+
+
+def attach_shared_memory(name):
+    """Attach to server-owned shared memory without tracking it for unlink."""
+
+    shm = shared_memory.SharedMemory(name=name)
+    resource_tracker.unregister(shm._name, "shared_memory")
+    return shm
 
 
 def run_driver(
@@ -240,12 +248,12 @@ def run_shmdriver(
             print(pos_bufname, h_bufname, ih_bufname, pot_bufname, f_bufname, vir_bufname)
 
             #shm objects
-            cell_shm = shared_memory.SharedMemory(name=h_bufname)
-            icell_shm = shared_memory.SharedMemory(name=ih_bufname)
-            pot_shm = shared_memory.SharedMemory(name=pot_bufname)
-            pos_shm = shared_memory.SharedMemory(name=pos_bufname)
-            f_shm = shared_memory.SharedMemory(name=f_bufname)
-            vir_shm = shared_memory.SharedMemory(name=vir_bufname)
+            cell_shm = attach_shared_memory(h_bufname)
+            icell_shm = attach_shared_memory(ih_bufname)
+            pot_shm = attach_shared_memory(pot_bufname)
+            pos_shm = attach_shared_memory(pos_bufname)
+            f_shm = attach_shared_memory(f_bufname)
+            vir_shm = attach_shared_memory(vir_bufname)
 
 
             # allocating numpy arrays in shared memory on the same buffer as in the server
@@ -313,6 +321,12 @@ def run_shmdriver(
             f_data = False
         elif header == Message("EXIT"):
             print("Received exit message from i-PI. Bye bye!")
+            cell_shm.close()
+            icell_shm.close()
+            pot_shm.close()
+            pos_shm.close()
+            f_shm.close()
+            vir_shm.close()
             return
 
 

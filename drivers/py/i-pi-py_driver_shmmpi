@@ -25,7 +25,7 @@ from ipi.pes import load_pes, __drivers__
 from ipi.utils.io.inputs import read_args_kwargs
 from mpi4py import MPI
 from ipi.utils.timing_manager import timers
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 
 description = """
 Minimal MPI Python driver for i-PI batch mode.
@@ -80,6 +80,14 @@ HDRLEN = 12  # number of characters of the default message strings
 def Message(mystr):
     """Returns a header of standard length HDRLEN."""
     return str.ljust(str.upper(mystr), HDRLEN).encode()
+
+
+def attach_shared_memory(name):
+    """Attach to server-owned shared memory without tracking it for unlink."""
+
+    shm = shared_memory.SharedMemory(name=name)
+    resource_tracker.unregister(shm._name, "shared_memory")
+    return shm
 
 def run_shmdriver(
     unix=False,
@@ -181,12 +189,12 @@ def run_shmdriver(
                 print(pos_bufname, h_bufname, ih_bufname, pot_bufname, f_bufname, vir_bufname)
 
                 #shm objects
-                cell_shm = shared_memory.SharedMemory(name=h_bufname)
-                icell_shm = shared_memory.SharedMemory(name=ih_bufname)
-                pot_shm = shared_memory.SharedMemory(name=pot_bufname)
-                pos_shm = shared_memory.SharedMemory(name=pos_bufname)
-                f_shm = shared_memory.SharedMemory(name=f_bufname)
-                vir_shm = shared_memory.SharedMemory(name=vir_bufname)
+                cell_shm = attach_shared_memory(h_bufname)
+                icell_shm = attach_shared_memory(ih_bufname)
+                pot_shm = attach_shared_memory(pot_bufname)
+                pos_shm = attach_shared_memory(pos_bufname)
+                f_shm = attach_shared_memory(f_bufname)
+                vir_shm = attach_shared_memory(vir_bufname)
 
 
                 # allocating numpy arrays in shared memory on the same buffer as in the server
@@ -291,6 +299,12 @@ def run_shmdriver(
         elif header == Message("EXIT"):
             if rank == 0:
                 print("Received exit message from i-PI. Bye bye!")
+                cell_shm.close()
+                icell_shm.close()
+                pot_shm.close()
+                pos_shm.close()
+                f_shm.close()
+                vir_shm.close()
                 timers.summary("driver_timing_breakdown")
             return
 
