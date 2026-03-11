@@ -55,6 +55,52 @@ def send_data(sock, data):
     sock.send(buf)
 
 
+def open_driver_socket(unix, address, port, sockets_prefix):
+    """Opens the control socket to i-PI."""
+
+    if unix:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(sockets_prefix + address)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.connect((address, port))
+    return sock
+
+
+def validate_force_payload(force, vir, pos):
+    """Checks returned force/virial arrays before sending them back."""
+
+    if not isinstance(force, np.ndarray) and force.dtype == np.float64:
+        raise ValueError(
+            "driver returned forces with the wrong type: we need a "
+            "numpy.ndarray containing 64-bit floating points values"
+        )
+
+    if not isinstance(vir, np.ndarray) and vir.dtype == np.float64:
+        raise ValueError(
+            "driver returned virial with the wrong type: we need a "
+            "numpy.ndarray containing 64-bit floating points values"
+        )
+
+    if force.size != pos.size:
+        raise ValueError(
+            "driver returned forces with the wrong size: number of "
+            "atoms and dimensions must match positions"
+        )
+
+    if vir.size != 9:
+        raise ValueError(
+            "driver returned a virial tensor which does not have 9 components"
+        )
+
+
+def recv_fixed(sock, length):
+    """Receives an exact number of bytes."""
+
+    return recv_data(sock, np.empty(length, dtype=np.uint8)).tobytes()
+
+
 def attach_shared_memory(name):
     """Attach to server-owned shared memory without tracking it for unlink."""
 
@@ -70,18 +116,11 @@ def run_driver(
     driver=Dummy_driver(),
     f_verbose=False,
     sockets_prefix="/tmp/ipi_",
+    shm=False,
 ):
     """Minimal socket client for i-PI."""
 
-    # Opens a socket to i-PI
-    if unix:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(sockets_prefix + address)
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # this reduces latency for the small messages passed by the i-PI protocol
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.connect((address, port))
+    sock = open_driver_socket(unix, address, port, sockets_prefix)
 
     f_init = False
     f_data = False
@@ -95,6 +134,19 @@ def run_driver(
     pot = 0.0
     force = np.zeros(0, float)
     vir = np.zeros((3, 3), float)
+    extras = ""
+
+    cell_shm = None
+    icell_shm = None
+    pot_shm = None
+    pos_shm = None
+    f_shm = None
+    vir_shm = None
+    pot_snp = None
+    pos_snp = None
+    f_snp = None
+    vir_snp = None
+
     while True:  # ah the infinite loop!
         header = sock.recv(HDRLEN)
         if f_verbose:
@@ -112,221 +164,98 @@ def run_driver(
             rid = recv_data(sock, np.int32())
             initlen = recv_data(sock, np.int32())
             initstr = recv_data(sock, np.chararray(initlen))
-            #initstr = recv_data(sock, np.empty(initlen, dtype=np.uint8))
 
             if f_verbose:
                 print(rid, "Initing...")
+
+            if shm:
+                nat = recv_data(sock, np.int32())
+                nbeads = recv_data(sock, np.int32())
+                if nbeads != 1:
+                    raise RuntimeError(
+                        "run_driver(shm=True) only supports single-bead shm mode; "
+                        "use the MPI shm driver for batched mode"
+                    )
+
+                pos_bufname = recv_fixed(sock, HDRLEN).decode("utf-8").strip()
+                h_bufname = recv_fixed(sock, HDRLEN).decode("utf-8").strip()
+                ih_bufname = recv_fixed(sock, HDRLEN).decode("utf-8").strip()
+                pot_bufname = recv_fixed(sock, HDRLEN).decode("utf-8").strip()
+                f_bufname = recv_fixed(sock, HDRLEN).decode("utf-8").strip()
+                vir_bufname = recv_fixed(sock, HDRLEN).decode("utf-8").strip()
+
+                if f_verbose:
+                    print(rid, initstr)
+                    print(f"natoms, nbeads: {nat}, {nbeads}")
+                    print("Driver initing SHM with buffer names:")
+                    print(pos_bufname, h_bufname, ih_bufname, pot_bufname, f_bufname, vir_bufname)
+
+                cell_shm = attach_shared_memory(h_bufname)
+                icell_shm = attach_shared_memory(ih_bufname)
+                pot_shm = attach_shared_memory(pot_bufname)
+                pos_shm = attach_shared_memory(pos_bufname)
+                f_shm = attach_shared_memory(f_bufname)
+                vir_shm = attach_shared_memory(vir_bufname)
+
+                cell_snp = np.ndarray((3, 3), dtype=np.float64, buffer=cell_shm.buf)
+                icell_snp = np.ndarray((3, 3), dtype=np.float64, buffer=icell_shm.buf)
+                pot_snp = np.ndarray((1), dtype=np.float64, buffer=pot_shm.buf)
+                pos_snp = np.ndarray((nat * 3), dtype=np.float64, buffer=pos_shm.buf)
+                f_snp = np.ndarray((nat * 3), dtype=np.float64, buffer=f_shm.buf)
+                vir_snp = np.ndarray((3, 3), dtype=np.float64, buffer=vir_shm.buf)
+
             f_init = True  # we are initialized now
         elif header == Message("POSDATA"):
-            # receives structural information
-            cell = recv_data(sock, cell)
-            icell = recv_data(
-                sock, icell
-            )  # inverse of the cell. mostly useless legacy stuff
-            nat = recv_data(sock, np.int32())
-            if len(pos) == 0:
-                # shapes up the position array
-                pos.resize((nat, 3), refcheck=False)
-                force.resize((nat, 3), refcheck=False)
+            if shm:
+                pos = pos_snp[:]
+                cell = cell_snp[:]
+                icell = icell_snp[:]
             else:
-                if len(pos) != nat:
-                    raise RuntimeError("Atom number changed during i-PI run")
-            pos = recv_data(sock, pos)
+                # receives structural information
+                cell = recv_data(sock, cell)
+                icell = recv_data(
+                    sock, icell
+                )  # inverse of the cell. mostly useless legacy stuff
+                nat = recv_data(sock, np.int32())
+                if len(pos) == 0:
+                    # shapes up the position array
+                    pos.resize((nat, 3), refcheck=False)
+                    force.resize((nat, 3), refcheck=False)
+                else:
+                    if len(pos) != nat:
+                        raise RuntimeError("Atom number changed during i-PI run")
+                pos = recv_data(sock, pos)
 
             ##### THIS IS THE TIME TO DO SOMETHING WITH THE POSITIONS!
             pot, force, vir, extras = driver(cell, pos)
             f_data = True
         elif header == Message("GETFORCE"):
-            sock.sendall(Message("FORCEREADY"))
+            validate_force_payload(force, vir, pos)
 
-            # sanity check in the returned values (catches bugs and inconsistencies in the implementation)
-            if not isinstance(force, np.ndarray) and force.dtype == np.float64:
-                raise ValueError(
-                    "driver returned forces with the wrong type: we need a "
-                    "numpy.ndarray containing 64-bit floating points values"
-                )
-
-            if not isinstance(vir, np.ndarray) and vir.dtype == np.float64:
-                raise ValueError(
-                    "driver returned virial with the wrong type: we need a "
-                    "numpy.ndarray containing 64-bit floating points values"
-                )
-
-            if force.size != pos.size:
-                raise ValueError(
-                    "driver returned forces with the wrong size: number of "
-                    "atoms and dimensions must match positions"
-                )
-
-            if vir.size != 9:
-                raise ValueError(
-                    "driver returned a virial tensor which does not have 9 components"
-                )
-
-            send_data(sock, np.float64(pot))
-            send_data(sock, np.int32(nat))
-            send_data(sock, force)
-            send_data(sock, vir)
-            send_data(sock, np.int32(len(extras)))
-            sock.sendall(extras.encode("utf-8"))
+            if shm:
+                pot_snp[:] = pot
+                f_snp[:] = force
+                vir_snp[:] = vir
+                sock.sendall(Message("FORCEREADY"))
+            else:
+                sock.sendall(Message("FORCEREADY"))
+                send_data(sock, np.float64(pot))
+                send_data(sock, np.int32(nat))
+                send_data(sock, force)
+                send_data(sock, vir)
+                send_data(sock, np.int32(len(extras)))
+                sock.sendall(extras.encode("utf-8"))
 
             f_data = False
         elif header == Message("EXIT"):
             print("Received exit message from i-PI. Bye bye!")
-            return
-
-def run_shmdriver(
-    unix=True,
-    address="",
-    port=12345,
-    driver=Dummy_driver(),
-    f_verbose=False,
-    sockets_prefix="/tmp/ipi_",
-):
-    """Minimal socket client for i-PI."""
-
-    # Opens a socket to i-PI
-    if unix:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(sockets_prefix + address)
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # this reduces latency for the small messages passed by the i-PI protocol
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.connect((address, port))
-
-    f_init = False
-    f_data = False
-
-    # initializes structure arrays
-    cell = np.zeros((3, 3), float)
-    icell = np.zeros((3, 3), float)
-    pos = np.zeros(0, float)
-
-    # initializes return arrays
-    pot = 0.0
-    force = np.zeros(0, float)
-    vir = np.zeros((3, 3), float)
-    
-    while True:  # ah the infinite loop!
-        header = sock.recv(HDRLEN)
-        if f_verbose:
-            print("Received ", header)
-        if header == Message("STATUS"):
-            # responds to a status request
-            if not f_init:
-                sock.sendall(Message("NEEDINIT"))
-            elif f_data:
-                sock.sendall(Message("HAVEDATA"))
-            else:
-                sock.sendall(Message("READY"))
-        elif header == Message("INIT"):
-            # initialization
-            print("start initing")
-            rid = recv_data(sock, np.int32())
-            initlen = recv_data(sock, np.int32())
-            initstr = recv_data(sock, np.chararray(initlen))
-            print("initstr")
-                  
-            # receiving nat and nbeads at init, necessary to be able to allocate the correct numpy shapes in SHM
-            nat = recv_data(sock, np.int32())
-            nbeads = recv_data(sock, np.int32())
-          
-            if f_verbose:
-                print(rid, initstr)
-                print(f"natoms, nbeads: {nat}, {nbeads}")
-            
-            # reading buffer names for shaerd memory access
-            pos_bufname = sock.recv(HDRLEN).decode("utf-8").strip()
-            h_bufname = sock.recv(HDRLEN).decode("utf-8").strip()
-            ih_bufname = sock.recv(HDRLEN).decode("utf-8").strip()
-            pot_bufname = sock.recv(HDRLEN).decode("utf-8").strip()
-            f_bufname = sock.recv(HDRLEN).decode("utf-8").strip()
-            vir_bufname = sock.recv(HDRLEN).decode("utf-8").strip()
-
-            print("Driver initing SHM with buffer names:")
-            print(pos_bufname, h_bufname, ih_bufname, pot_bufname, f_bufname, vir_bufname)
-
-            #shm objects
-            cell_shm = attach_shared_memory(h_bufname)
-            icell_shm = attach_shared_memory(ih_bufname)
-            pot_shm = attach_shared_memory(pot_bufname)
-            pos_shm = attach_shared_memory(pos_bufname)
-            f_shm = attach_shared_memory(f_bufname)
-            vir_shm = attach_shared_memory(vir_bufname)
-
-
-            # allocating numpy arrays in shared memory on the same buffer as in the server
-            cell_snp = np.ndarray((3,3), dtype=np.float64, buffer=cell_shm.buf)
-            icell_snp = np.ndarray((3,3), dtype=np.float64, buffer=icell_shm.buf)
-            pot_snp = np.ndarray((1), dtype=np.float64, buffer=pot_shm.buf)
-            pos_snp = np.ndarray((nat*3), dtype=np.float64, buffer=pos_shm.buf)
-            f_snp = np.ndarray((nat*3), dtype=np.float64, buffer=f_shm.buf)
-            vir_snp = np.ndarray((3,3), dtype=np.float64, buffer=vir_shm.buf)
-
-            
-            
-            f_init = True  # we are initialized now
-        
-        elif header == Message("POSDATA"):
-            # receives structural information
-            pos = pos_snp[:]
-            cell = cell_snp[:]
-            icell = icell_snp[:]
-            
-            ''' 
-            if len(pos) == 0:
-                # shapes up the position array
-                pos.resize((nat, 3), refcheck=False)
-                force.resize((nat, 3), refcheck=False)
-            else:
-                if len(pos) != nat:
-                    raise RuntimeError("Atom number changed during i-PI run")
-            '''
-
-            ##### THIS IS THE TIME TO DO SOMETHING WITH THE POSITIONS!
-            pot, force, vir, extras = driver(cell, pos)
-            f_data = True
-        elif header == Message("GETFORCE"):
-
-            # sanity check in the returned values (catches bugs and inconsistencies in the implementation)
-            if not isinstance(force, np.ndarray) and force.dtype == np.float64:
-                raise ValueError(
-                    "driver returned forces with the wrong type: we need a "
-                    "numpy.ndarray containing 64-bit floating points values"
-                )
-
-            if not isinstance(vir, np.ndarray) and vir.dtype == np.float64:
-                raise ValueError(
-                    "driver returned virial with the wrong type: we need a "
-                    "numpy.ndarray containing 64-bit floating points values"
-                )
-
-            if force.size != pos.size:
-                raise ValueError(
-                    "driver returned forces with the wrong size: number of "
-                    "atoms and dimensions must match positions"
-                )
-
-            if len(vir.flatten()) != 9:
-                raise ValueError(
-                    "driver returned a virial tensor which does not have 9 components"
-                )
-
-            pot_snp = pot
-            f_snp = force[:]
-            vir_snp = vir[:]
-
-            sock.sendall(Message("FORCEREADY"))
-            f_data = False
-        elif header == Message("EXIT"):
-            print("Received exit message from i-PI. Bye bye!")
-            cell_shm.close()
-            icell_shm.close()
-            pot_shm.close()
-            pos_shm.close()
-            f_shm.close()
-            vir_shm.close()
+            if shm:
+                cell_shm.close()
+                icell_shm.close()
+                pot_shm.close()
+                pos_shm.close()
+                f_shm.close()
+                vir_shm.close()
             return
 
 
@@ -411,13 +340,14 @@ if __name__ == "__main__":
     d_f = cls(*driver_args, **driver_kwargs)
 
     if args.shm:
-        run_shmdriver(
+        run_driver(
             unix=True,
             address=args.address,
             port=args.port,
             driver=d_f,
             f_verbose=args.verbose,
             sockets_prefix=args.sockets_prefix,
+            shm=True,
         )
     else:
         run_driver(
