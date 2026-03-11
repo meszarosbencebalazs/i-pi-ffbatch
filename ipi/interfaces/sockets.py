@@ -690,7 +690,7 @@ class Driver(DriverSocket):
        locked: Flag to mark if the client has been working consistently on one image.
     """
 
-    def __init__(self, sock):
+    def __init__(self, sock, shm=False):
         """Initialises Driver.
 
         Args:
@@ -698,11 +698,43 @@ class Driver(DriverSocket):
         """
 
         super(Driver, self).__init__(sock)
+        self.shm = shm
         self.waitstatus = False
         self.status = Status.Up
         self.lastreq = None
         self.locked = False
         self.exit_on_disconnect = False
+        self.first_dispatch = True
+        self.nat = None
+        self.nbeads = None
+
+        self.id = sock.fileno()
+        self.pos_bufname = f"IPI-POS-{self.id}"
+        self.h_bufname = f"IPI-H-{self.id}"
+        self.ih_bufname = f"IPI-IH-{self.id}"
+        self.pot_bufname = f"IPI-POT-{self.id}"
+        self.f_bufname = f"IPI-F-{self.id}"
+        self.vir_bufname = f"IPI-VIR-{self.id}"
+
+        self.pos_shm = None
+        self.h_shm = None
+        self.ih_shm = None
+        self.pot_shm = None
+        self.f_shm = None
+        self.vir_shm = None
+
+        self.pos_snp = None
+        self.h_snp = None
+        self.ih_snp = None
+        self.pot_snp = None
+        self.f_snp = None
+        self.vir_snp = None
+
+        if self.shm:
+            info(
+                f" @SOCKET: SHM driver initialized with buffer: {self.pos_bufname}",
+                verbosity.low,
+            )
 
     def shutdown(self, how=socket.SHUT_RDWR):
         """Tries to send an exit message to clients to let them exit gracefully."""
@@ -716,6 +748,20 @@ class Driver(DriverSocket):
 
         self.send_msg("exit")
         self.status = Status.Disconnected
+
+        if self.shm:
+            for handle in (
+                self.pos_shm,
+                self.h_shm,
+                self.ih_shm,
+                self.pot_shm,
+                self.f_shm,
+                self.vir_shm,
+            ):
+                if handle is None:
+                    continue
+                handle.close()
+                handle.unlink()
 
         super(DriverSocket, self).shutdown(how)
 
@@ -841,12 +887,24 @@ class Driver(DriverSocket):
         if self.status & Status.NeedsInit:
             try:
                 # combines all messages in one to reduce latency
-                self.sendall(
+                payload = (
                     MESSAGE["init"]
                     + np.int32(rid)
                     + np.int32(len(pars))
                     + pars.encode()
                 )
+                if self.shm:
+                    payload += (
+                        np.int32(self.nat).tobytes()
+                        + np.int32(self.nbeads).tobytes()
+                        + Message(self.pos_bufname)
+                        + Message(self.h_bufname)
+                        + Message(self.ih_bufname)
+                        + Message(self.pot_bufname)
+                        + Message(self.f_bufname)
+                        + Message(self.vir_bufname)
+                    )
+                self.sendall(payload)
             except:
                 self.get_status()
                 return
@@ -867,21 +925,25 @@ class Driver(DriverSocket):
         # this is to handle the batch mode for multiple bead positions
         timers.start
         if pos.ndim == 2:
-            nat = pos.shape[1] // 3
-            nbeads = pos.shape[0]
+            self.nat = pos.shape[1] // 3
+            self.nbeads = pos.shape[0]
         else:
-            nat = len(pos) // 3
-            nbeads = 1
+            self.nat = len(pos) // 3
+            self.nbeads = 1
         if self.status & Status.Ready:
             try:
-                # reduces latency by combining all messages in one
-                self.sendall(
-                    MESSAGE["posdata"]  # header
-                    + h_ih[0].tobytes()  # cell
-                    + h_ih[1].tobytes()  # inverse cell
-                    + np.int32(len(pos) // 3).tobytes()  # length of position array
-                    + pos.tobytes()  # positions
-                )
+                if self.shm:
+                    self.np_to_shm({"pos": pos, "cell": h_ih})
+                    self.sendall(MESSAGE["posdata"])
+                else:
+                    # reduces latency by combining all messages in one
+                    self.sendall(
+                        MESSAGE["posdata"]  # header
+                        + h_ih[0].tobytes()  # cell
+                        + h_ih[1].tobytes()  # inverse cell
+                        + np.int32(len(pos) // 3).tobytes()  # length of position array
+                        + pos.tobytes()  # positions
+                    )
                 self.status = Status.Up | Status.Busy
             except socket.timeout:
                 warning(
@@ -938,6 +1000,9 @@ class Driver(DriverSocket):
                     raise Disconnected()
         else:
             raise InvalidStatus("Status in getforce was " + str(self.status))
+
+        if self.shm:
+            return self.shm_to_np()
 
         mu = np.float64()
         mu = self.recvall(mu)
@@ -1003,24 +1068,98 @@ class Driver(DriverSocket):
     def dispatch_prepare(self, r):
         """Optional hook for transport-specific setup before dispatch."""
 
+        if self.shm and self.first_dispatch:
+            self.alloc_shm(r)
+            self.first_dispatch = False
+
     def dispatch_sendpos(self, r):
         """Transport-specific request transmission."""
 
-        self.sendpos(r["pos"][r["active"]], r["cell"])
+        if self.shm:
+            self.sendpos(r["pos"], r["cell"])
+        else:
+            self.sendpos(r["pos"][r["active"]], r["cell"])
 
     def dispatch_check_result(self, r):
         """Validates result sizes for the current transport."""
 
-        if len(r["result"][1]) != len(r["pos"][r["active"]]):
-            raise InvalidSize
+        if self.shm:
+            if self.nbeads == 1:
+                if len(r["result"][1]) != len(r["active"]):
+                    raise InvalidSize
+            else:
+                if r["result"][1].shape != r["pos"].shape:
+                    raise InvalidSize
+        else:
+            if len(r["result"][1]) != len(r["pos"][r["active"]]):
+                raise InvalidSize
 
     def dispatch_resize_result(self, r):
         """Expands active-subset forces back to the full system if needed."""
 
-        if len(r["active"]) != len(r["pos"]):
+        if self.shm:
+            if self.nbeads == 1 and len(r["active"]) != len(r["pos"]):
+                rftemp = r["result"][1]
+                r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
+                r["result"][1] = r["result"][1].at[r["active"]].set(rftemp)
+        elif len(r["active"]) != len(r["pos"]):
             rftemp = r["result"][1]
             r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
             r["result"][1][r["active"]] = rftemp
+
+    def alloc_shm(self, r):
+        if r["pos"].ndim == 1:
+            self.nat = len(r["pos"]) // 3
+            self.nbeads = 1
+        else:
+            self.nat = r["pos"].shape[1] // 3
+            self.nbeads = r["pos"].shape[0]
+
+        self.pos_shm = shared_memory.SharedMemory(
+            create=True, size=r["pos"].size * 8, name=self.pos_bufname
+        )
+        self.h_shm = shared_memory.SharedMemory(
+            create=True, size=9 * 8, name=self.h_bufname
+        )
+        self.ih_shm = shared_memory.SharedMemory(
+            create=True, size=9 * 8, name=self.ih_bufname
+        )
+        self.pot_shm = shared_memory.SharedMemory(
+            create=True, size=self.nbeads * 8, name=self.pot_bufname
+        )
+        self.f_shm = shared_memory.SharedMemory(
+            create=True, size=r["pos"].size * 8, name=self.f_bufname
+        )
+        self.vir_shm = shared_memory.SharedMemory(
+            create=True, size=self.nbeads * 9 * 8, name=self.vir_bufname
+        )
+
+        self.pos_snp = np.ndarray(
+            r["pos"].shape, dtype=np.float64, buffer=self.pos_shm.buf
+        )
+        self.h_snp = np.ndarray((3, 3), dtype=np.float64, buffer=self.h_shm.buf)
+        self.ih_snp = np.ndarray((3, 3), dtype=np.float64, buffer=self.ih_shm.buf)
+        self.pot_snp = np.ndarray(
+            (self.nbeads), dtype=np.float64, buffer=self.pot_shm.buf
+        )
+        self.f_snp = np.ndarray(r["pos"].shape, dtype=np.float64, buffer=self.f_shm.buf)
+        self.vir_snp = np.ndarray(
+            (self.nbeads, 3, 3), dtype=np.float64, buffer=self.vir_shm.buf
+        )
+
+    def np_to_shm(self, r):
+        self.pos_snp, self.h_snp, self.ih_snp = r["pos"], r["cell"][0], r["cell"][1]
+
+    def shm_to_np(self):
+        mxtradict = ""
+        if self.nbeads == 1:
+            return [
+                float(self.pot_snp),
+                self.f_snp.squeeze(),
+                self.vir_snp.squeeze(),
+                mxtradict,
+            ]
+        return [self.pot_snp, self.f_snp, self.vir_snp, mxtradict]
 
     def dispatch(self, r):
         """Dispatches a request r and looks after it setting results
@@ -1081,210 +1220,6 @@ class Driver(DriverSocket):
 
         # marks the request as done as the very last thing
         r["status"] = "Done"
-
-
-class SHMDriver(Driver):
-    """Shared-memory transport specialization of ``Driver``."""
-
-    def __init__(self, sock):
-        super(SHMDriver, self).__init__(sock)
-        self.first_dispatch = True
-        self.nat = None
-        self.nbeads = None
-
-        self.id = sock.fileno()
-        self.pos_bufname = f"IPI-POS-{self.id}"
-        self.h_bufname = f"IPI-H-{self.id}"
-        self.ih_bufname = f"IPI-IH-{self.id}"
-        self.pot_bufname = f"IPI-POT-{self.id}"
-        self.f_bufname = f"IPI-F-{self.id}"
-        self.vir_bufname = f"IPI-VIR-{self.id}"
-
-        info(
-            f" @SOCKET: SHMDriver initied with buffer: {self.pos_bufname}",
-            verbosity.low,
-        )
-
-        self.pos_shm = None
-        self.h_shm = None
-        self.ih_shm = None
-        self.pot_shm = None
-        self.f_shm = None
-        self.vir_shm = None
-
-        self.pos_snp = None
-        self.h_snp = None
-        self.ih_snp = None
-        self.pot_snp = None
-        self.f_snp = None
-        self.vir_snp = None
-
-    def shutdown(self, how=socket.SHUT_RDWR):
-        if self.exit_on_disconnect:
-            trd = threading.Thread(
-                target=softexit.trigger, kwargs={"message": "Client shutdown."}
-            )
-            trd.daemon = True
-            trd.start()
-
-        self.send_msg("exit")
-        self.status = Status.Disconnected
-
-        for handle in (
-            self.pos_shm,
-            self.h_shm,
-            self.ih_shm,
-            self.pot_shm,
-            self.f_shm,
-            self.vir_shm,
-        ):
-            if handle is None:
-                continue
-            handle.close()
-            handle.unlink()
-
-        super(DriverSocket, self).shutdown(how)
-
-    def initialize(self, rid, pars):
-        if self.status & Status.NeedsInit:
-            try:
-                self.sendall(
-                    MESSAGE["init"]
-                    + np.int32(rid)
-                    + np.int32(len(pars))
-                    + pars.encode()
-                    + np.int32(self.nat)
-                    + np.int32(self.nbeads)
-                    + Message(self.pos_bufname)
-                    + Message(self.h_bufname)
-                    + Message(self.ih_bufname)
-                    + Message(self.pot_bufname)
-                    + Message(self.f_bufname)
-                    + Message(self.vir_bufname)
-                )
-            except:
-                self.get_status()
-                return
-        else:
-            raise InvalidStatus("Status in init was " + self.status)
-
-    def sendpos(self, r):
-        global TIMEOUT
-
-        if self.status & Status.Ready:
-            try:
-                self.np_to_shm(r)
-                self.sendall(MESSAGE["posdata"])
-                self.status = Status.Up | Status.Busy
-            except socket.timeout:
-                warning(
-                    f"Timeout in sendall after {TIMEOUT}s: resetting status and increasing timeout",
-                    verbosity.quiet,
-                )
-                self.status = Status.Timeout
-                TIMEOUT *= 2
-                return
-            except Exception as exc:
-                warning(
-                    f"Other exception during posdata receive: {exc}", verbosity.quiet
-                )
-                raise exc
-        else:
-            raise InvalidStatus("Status in sendpos was " + self.status)
-
-    def getforce(self):
-        if self.status & Status.HasData:
-            self.send_msg("getforce")
-            reply = ""
-            while True:
-                try:
-                    reply = self.recv_msg()
-                except socket.timeout:
-                    warning(
-                        " @SOCKET:   Timeout in getforce, trying again!", verbosity.low
-                    )
-                    continue
-                except:
-                    warning(
-                        " @SOCKET:   Error while receiving message: %s" % (reply),
-                        verbosity.low,
-                    )
-                    raise Disconnected()
-                if reply == MESSAGE["forceready"]:
-                    break
-                else:
-                    warning(
-                        " @SOCKET:   Unexpected getforce reply: %s" % (reply),
-                        verbosity.low,
-                    )
-                if reply == "":
-                    raise Disconnected()
-        else:
-            raise InvalidStatus("Status in getforce was " + str(self.status))
-
-        return self.shm_to_np()
-
-    def alloc_shm(self, r):
-        if r["pos"].ndim == 1:
-            self.nat = len(r["pos"]) // 3
-            self.nbeads = 1
-        else:
-            self.nat = r["pos"].shape[1] // 3
-            self.nbeads = r["pos"].shape[0]
-
-        self.pos_shm = shared_memory.SharedMemory(
-            create=True, size=r["pos"].size * 8, name=self.pos_bufname
-        )
-        self.h_shm = shared_memory.SharedMemory(create=True, size=9 * 8, name=self.h_bufname)
-        self.ih_shm = shared_memory.SharedMemory(create=True, size=9 * 8, name=self.ih_bufname)
-        self.pot_shm = shared_memory.SharedMemory(
-            create=True, size=self.nbeads * 8, name=self.pot_bufname
-        )
-        self.f_shm = shared_memory.SharedMemory(
-            create=True, size=r["pos"].size * 8, name=self.f_bufname
-        )
-        self.vir_shm = shared_memory.SharedMemory(
-            create=True, size=self.nbeads * 9 * 8, name=self.vir_bufname
-        )
-
-        self.pos_snp = np.ndarray(r["pos"].shape, dtype=np.float64, buffer=self.pos_shm.buf)
-        self.h_snp = np.ndarray((3, 3), dtype=np.float64, buffer=self.h_shm.buf)
-        self.ih_snp = np.ndarray((3, 3), dtype=np.float64, buffer=self.ih_shm.buf)
-        self.pot_snp = np.ndarray((self.nbeads), dtype=np.float64, buffer=self.pot_shm.buf)
-        self.f_snp = np.ndarray(r["pos"].shape, dtype=np.float64, buffer=self.f_shm.buf)
-        self.vir_snp = np.ndarray((self.nbeads, 3, 3), dtype=np.float64, buffer=self.vir_shm.buf)
-
-    def np_to_shm(self, r):
-        self.pos_snp, self.h_snp, self.ih_snp = r["pos"], r["cell"][0], r["cell"][1]
-
-    def shm_to_np(self):
-        mxtradict = ""
-        if self.nbeads == 1:
-            return [float(self.pot_snp), self.f_snp.squeeze(), self.vir_snp.squeeze(), mxtradict]
-        return [self.pot_snp, self.f_snp, self.vir_snp, mxtradict]
-
-    def dispatch_prepare(self, r):
-        if self.first_dispatch:
-            self.alloc_shm(r)
-            self.first_dispatch = False
-
-    def dispatch_sendpos(self, r):
-        self.sendpos(r)
-
-    def dispatch_check_result(self, r):
-        if self.nbeads == 1:
-            if len(r["result"][1]) != len(r["active"]):
-                raise InvalidSize
-        else:
-            if r["result"][1].shape != r["pos"].shape:
-                raise InvalidSize
-
-    def dispatch_resize_result(self, r):
-        if self.nbeads == 1 and len(r["active"]) != len(r["pos"]):
-            rftemp = r["result"][1]
-            r["result"][1] = np.zeros(len(r["pos"]), dtype=np.float64)
-            r["result"][1] = r["result"][1].at[r["active"]].set(rftemp)
-
 
 class InterfaceSocket(object):
     """Host server class.
@@ -1520,7 +1455,7 @@ class InterfaceSocket(object):
                 client.settimeout(TIMEOUT)
                
                 if self.mode == "shm":
-                    driver = SHMDriver(client)
+                    driver = Driver(client, shm=True)
                     info(" @interfacesocket.pool_update: Using SHM communication", verbosity.low)
                 else:
                     driver = Driver(client)
